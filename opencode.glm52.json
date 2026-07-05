@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "glm52-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GLM 5.2 (MI325X/SGLang)",
+      "options": {
+        "baseURL": "http://__HOST__:__PORT__/v1",
+        "apiKey": "{env:SGLANG_API_KEY}"
+      },
+      "models": {
+        "glm-5.2": {
+          "name": "GLM 5.2",
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "tool_call": true,
+          "reasoning": true
+        }
+      }
+    }
+  }
+}

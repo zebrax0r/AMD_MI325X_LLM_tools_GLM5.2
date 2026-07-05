@@ -1,0 +1,65 @@
+# Configuration for serve-glm52.sh — copy to glm52.env and edit.
+#
+#   cp glm52-env.example glm52.env
+#
+# Every value uses the ${VAR:-default} form, so anything you export in your
+# shell (or in an sbatch --export) takes precedence over this file.
+# glm52.env contains your HF token — keep it out of git (see .gitignore).
+
+# ── Required ────────────────────────────────────────────────────────────────
+
+# Big shared filesystem path for the HuggingFace cache. GLM-5.2-FP8 weights
+# are ~750 GB, so point this at scratch / project space, NOT your home dir.
+# Must be visible from the compute nodes (and the login node if you prefetch).
+export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-}"
+# e.g. export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-/scratch/project/glm52/hf-cache}"
+
+# HuggingFace token, needed for the first weights download.
+# Either set the token directly ...
+export HF_TOKEN="${HF_TOKEN:-}"
+# ... or point at a file containing only the token (safer for shared configs):
+export HF_TOKEN_FILE="${HF_TOKEN_FILE:-}"
+
+# ── Endpoint auth ───────────────────────────────────────────────────────────
+
+# API key for the SGLang endpoint (sent by clients as "Authorization: Bearer ...").
+# Leave empty to have serve-glm52.sh generate one and persist it to
+# ${MODEL_CACHE_DIR}/glm52-api-key so it stays stable across jobs.
+export SGLANG_API_KEY="${SGLANG_API_KEY:-}"
+
+# ── Model / image (defaults are correct for an 8x MI325X node) ─────────────
+
+export MODEL_ID="${MODEL_ID:-zai-org/GLM-5.2-FP8}"
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm-5.2}"
+export SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616}"
+
+# If you later get MI355X (gfx950) time, switch to the blog-post setup:
+#   export MODEL_ID="amd/GLM-5.2-MXFP4"
+#   export SGLANG_IMAGE="lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618"
+#   export TP_SIZE=4
+#   export EXTRA_SGLANG_ARGS="--dp 2 --enable-dp-attention"
+
+# ── Serving parameters ──────────────────────────────────────────────────────
+
+export PORT="${PORT:-30000}"
+
+# Tensor-parallel degree = number of GPUs to use. "auto" uses however many GPUs
+# SLURM allocated to the job (handy on shared 8-GPU nodes where you may only get
+# a slice). Weights are ~750 GB and must fit: MI300X (192 GB) needs all 8;
+# MI325X (256 GB) needs at least 4. Valid explicit values: 4 or 8 (not 6).
+export TP_SIZE="${TP_SIZE:-auto}"
+
+export CONTEXT_LEN="${CONTEXT_LEN:-262144}"     # model supports up to 1M
+export MEM_FRACTION="${MEM_FRACTION:-0.85}"
+export SHM_SIZE="${SHM_SIZE:-64g}"
+
+# aiter fused allreduce (from the wafer.ai blog; validated there on MI355X).
+# Set to 0 if you see NCCL/RCCL or allreduce-related crashes on MI325X.
+export ENABLE_AITER_ALLREDUCE_FUSION="${ENABLE_AITER_ALLREDUCE_FUSION:-1}"
+
+# Seconds to wait for the server to come up (first run downloads ~750 GB of
+# weights unless you prefetched with './serve-glm52.sh download').
+export READY_TIMEOUT="${READY_TIMEOUT:-7200}"
+
+# Extra flags appended verbatim to sglang.launch_server.
+export EXTRA_SGLANG_ARGS="${EXTRA_SGLANG_ARGS:-}"
