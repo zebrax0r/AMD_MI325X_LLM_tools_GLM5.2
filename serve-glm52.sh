@@ -59,6 +59,19 @@ CONTEXT_LEN="${CONTEXT_LEN:-262144}"
 # away ~38 GB of KV cache per GPU. Set a number here only to work around OOM.
 MEM_FRACTION="${MEM_FRACTION:-}"
 SHM_SIZE="${SHM_SIZE:-64g}"
+
+# podman defaults --pids-limit to 2048, and under cgroup v2 *threads* count
+# against it. Each TP rank runs an OpenMP pool sized to the whole machine plus
+# a weight-loader thread pool, so on a many-core node 8 ranks blow past 2048
+# during weight loading and Python raises "can't start new thread". -1 removes
+# the cap; podman ignores it if cgroups aren't delegated.
+PIDS_LIMIT="${PIDS_LIMIT:--1}"
+
+# Threads per rank for OpenMP/torch CPU ops. Unset, each rank grabs every core
+# on the node, so TP_SIZE ranks oversubscribe the CPU by TP_SIZE-fold and pile
+# up threads. "auto" divides the node's cores evenly between the ranks.
+OMP_THREADS="${OMP_THREADS:-auto}"
+
 ENABLE_AITER_ALLREDUCE_FUSION="${ENABLE_AITER_ALLREDUCE_FUSION:-1}"
 READY_TIMEOUT="${READY_TIMEOUT:-7200}"
 EXTRA_SGLANG_ARGS="${EXTRA_SGLANG_ARGS:-}"
@@ -269,6 +282,48 @@ if [[ "$TP_SIZE" -lt 4 ]]; then
     warn "TP_SIZE=$TP_SIZE is almost certainly too small — GLM-5.2-FP8 weights (~750 GB) need at least 4x256GB (MI325X) or 8x192GB (MI300X)."
 fi
 
+# ── Thread budget ───────────────────────────────────────────────────────────
+#
+# This is where weight loading fails on a many-core node. Each of the TP_SIZE
+# ranks runs an OpenMP pool plus a loader pool of up to min(32, cores+4)
+# threads, and under cgroup v2 threads count against the pids limit. Left
+# alone, 8 ranks on a 192-core node want well over podman's default 2048 and
+# Python raises "can't start new thread" partway through loading the shards.
+
+host_cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)"
+
+# Divide the node's cores between the ranks rather than letting each rank size
+# its OpenMP pool to the whole machine.
+if [[ "$OMP_THREADS" == "auto" ]]; then
+    if [[ "$host_cores" -gt 0 && "$TP_SIZE" -gt 0 ]]; then
+        OMP_THREADS=$(( host_cores / TP_SIZE ))
+        (( OMP_THREADS < 1 )) && OMP_THREADS=1
+    else
+        OMP_THREADS=""
+        warn "Could not detect the core count; leaving OMP_NUM_THREADS unset."
+    fi
+fi
+
+nproc_soft="$(ulimit -u 2>/dev/null || echo unknown)"
+log "Threads: $host_cores cores, TP=$TP_SIZE, OMP_NUM_THREADS=${OMP_THREADS:-unset}, ulimit -u=$nproc_soft, --pids-limit=$PIDS_LIMIT"
+
+if [[ -n "$OMP_THREADS" ]]; then
+    # Each rank: its OpenMP pool, plus the loader pool, plus slack for RCCL and
+    # the interpreter. Deliberately a rough floor, not a precise model.
+    loader_threads=32
+    (( host_cores + 4 < loader_threads )) && loader_threads=$(( host_cores + 4 ))
+    want_threads=$(( TP_SIZE * (OMP_THREADS + loader_threads + 16) ))
+    log "Estimated peak thread count during load: ~$want_threads"
+
+    if [[ "$nproc_soft" =~ ^[0-9]+$ && "$want_threads" -gt "$nproc_soft" ]]; then
+        warn "ulimit -u is $nproc_soft but loading may want ~$want_threads threads."
+        warn "  Raise it ('ulimit -u $(( want_threads * 2 ))') or lower OMP_THREADS, or startup will die with 'can't start new thread'."
+    fi
+    if [[ "$PIDS_LIMIT" =~ ^[0-9]+$ && "$PIDS_LIMIT" -gt 0 && "$want_threads" -gt "$PIDS_LIMIT" ]]; then
+        warn "PIDS_LIMIT=$PIDS_LIMIT is below the ~$want_threads threads loading may want. Set PIDS_LIMIT=-1."
+    fi
+fi
+
 # Port free?
 if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
     exec 3>&- 3<&- || true
@@ -346,6 +401,7 @@ gpu_env=()
 [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && gpu_env+=(-e CUDA_VISIBLE_DEVICES)
 
 perf_env=(-e "SGLANG_USE_AITER=$USE_AITER")
+[[ -n "$OMP_THREADS" ]] && perf_env+=(-e "OMP_NUM_THREADS=$OMP_THREADS")
 [[ "$AITER_AOT_GLUON" == "1" ]] && perf_env+=(-e AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)
 if [[ "$USE_AITER" == "1" ]]; then
     log "SGLANG_USE_AITER=1 — expect 'Setting page size to 64 for DeepSeek DSA' in the log."
@@ -365,6 +421,7 @@ podman run -d --rm --name "$CONTAINER_NAME" --replace \
     --security-opt seccomp=unconfined \
     --group-add keep-groups \
     --network=host --shm-size="$SHM_SIZE" \
+    --pids-limit "$PIDS_LIMIT" \
     -v "$MODEL_CACHE_DIR":/root/.cache/huggingface \
     -e HF_HOME=/root/.cache/huggingface \
     -e HF_TOKEN \
