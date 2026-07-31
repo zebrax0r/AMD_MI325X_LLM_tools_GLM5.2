@@ -350,6 +350,8 @@ All knobs live in `glm52.env` (copied from `glm52-env.example`). Anything you
 | `CONTEXT_LEN` | `262144` | Max context length |
 | `MEM_FRACTION` | *(empty)* | `--mem-fraction-static`. Empty = let SGLang size it from GPU capacity. Set a number only to work around OOM |
 | `SHM_SIZE` | `64g` | Container `/dev/shm` size |
+| `OMP_THREADS` | `auto` | `OMP_NUM_THREADS` per rank. `auto` = node cores ÷ `TP_SIZE`. See [`can't start new thread`](#cant-start-new-thread-during-weight-loading) |
+| `PIDS_LIMIT` | `-1` | podman `--pids-limit`. `-1` = uncapped |
 | `USE_AITER` | `1` | `SGLANG_USE_AITER`. Required for the fast DSA path — see [Performance tuning](#performance-tuning) |
 | `AITER_AOT_GLUON` | `0` | `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS`. Set `1` if the log still reports DSA page size 1 |
 | `ENABLE_AITER_ALLREDUCE_FUSION` | `1` | Toggle `--enable-aiter-allreduce-fusion` (set `0` if allreduce crashes) |
@@ -474,6 +476,19 @@ MXFP4 also requires `SGLANG_USE_AITER=1`, which `USE_AITER=1` already sets.
 - **`--enable-aiter-allreduce-fusion`** comes from the wafer.ai post (validated
   there on MI355X). If you hit allreduce/RCCL crashes on MI325X, set
   `ENABLE_AITER_ALLREDUCE_FUSION=0`.
+- <a id="cant-start-new-thread-during-weight-loading"></a>**`RuntimeError: can't start new thread` during weight loading**: the ranks
+  ran out of thread headroom. Each TP rank runs an OpenMP pool plus a
+  weight-loader pool of up to `min(32, cores+4)` threads
+  ([`deepseek_weight_loader.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py)
+  creates its `ThreadPoolExecutor` with no `max_workers`). Unset,
+  every rank sizes its OpenMP pool to the whole node — on a 192-core node with
+  TP8 that is ~1900 threads before RCCL, past podman's default `--pids-limit`
+  of 2048, and under cgroup v2 threads count against that limit. The defaults
+  here fix both ends: `OMP_THREADS=auto` divides cores between ranks (192/8 →
+  24, dropping the estimate to ~600) and `PIDS_LIMIT=-1` removes the cap. The
+  script prints its thread budget at startup and warns if `ulimit -u` looks too
+  low. If podman ignores `--pids-limit` because cgroups aren't delegated to your
+  user, lower `OMP_THREADS` further instead.
 - **Port conflicts**: default `PORT=30000`; the script refuses to start if the
   port is already taken on the node.
 - **Only N GPUs visible**: if the script warns that fewer than `TP_SIZE` GPUs are

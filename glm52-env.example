@@ -53,6 +53,26 @@ export TP_SIZE="${TP_SIZE:-auto}"
 export CONTEXT_LEN="${CONTEXT_LEN:-262144}"     # model supports up to 1M
 export SHM_SIZE="${SHM_SIZE:-64g}"
 
+# ── Thread budget (leave these alone unless startup dies during load) ───────
+#
+# Symptom this exists to prevent:
+#   RuntimeError: can't start new thread     (partway through loading shards)
+#
+# Each TP rank runs an OpenMP pool plus a weight-loader pool of up to
+# min(32, cores+4) threads. Unset, every rank sizes its OpenMP pool to the
+# whole node, so on a 192-core node 8 ranks want ~1900 threads before RCCL and
+# torch's own pools — past podman's default --pids-limit of 2048, and threads
+# count against it under cgroup v2.
+#
+# "auto" divides the node's cores evenly between the ranks (192/8 -> 24), which
+# is also just better CPU hygiene: 8 ranks each grabbing all 192 cores
+# oversubscribes the machine eightfold.
+export OMP_THREADS="${OMP_THREADS:-auto}"
+
+# -1 removes podman's pids cap entirely. podman ignores it if cgroups aren't
+# delegated to your user, in which case lower OMP_THREADS instead.
+export PIDS_LIMIT="${PIDS_LIMIT:--1}"
+
 # Leave MEM_FRACTION empty to let SGLang derive --mem-fraction-static from the
 # GPU's memory capacity. The old hard-coded 0.85 capped a 256 GB MI325X ~38 GB
 # per GPU below what its heuristic would allow — roughly 300 GB of KV cache
