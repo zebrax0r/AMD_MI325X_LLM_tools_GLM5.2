@@ -69,10 +69,16 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     echo "Wrote new opencode config: $CONFIG_PATH"
 elif command -v jq >/dev/null 2>&1; then
     # Merge just our provider entry into the existing config, preserving
-    # everything else (including other providers).
+    # everything else (including other providers). model/small_model are set
+    # with //= so an existing preference is never overwritten — but a config
+    # that has neither gets pointed at GLM-5.2, including for the small_model
+    # role (titles, summarisation), which otherwise reaches for a cloud
+    # provider that a compute node usually cannot see.
     tmp="$(mktemp)"
     jq --argjson new "$provider_json" \
-       '.provider = ((.provider // {}) + $new.provider)' \
+       '.provider = ((.provider // {}) + $new.provider)
+        | .model //= $new.model
+        | .small_model //= $new.small_model' \
        "$CONFIG_PATH" > "$tmp"
     cp "$CONFIG_PATH" "$CONFIG_PATH.bak"
     mv "$tmp" "$CONFIG_PATH"

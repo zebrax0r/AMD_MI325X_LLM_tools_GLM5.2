@@ -172,16 +172,53 @@ API_KEY="$(resolve_api_key)"
 
 # ── Ensure cloudflared binary ───────────────────────────────────────────────
 
+# Pinned rather than tracking 'latest': this binary is downloaded onto an HPC
+# node and executed, so the version and its hash should change only when
+# someone in this repo decides they do. To bump, set CLOUDFLARED_VERSION, run
+# the download, and paste the printed sha256 back in here.
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-2026.7.3}"
+# shellcheck disable=SC2034  # read indirectly as ${!expected_var} below
+CLOUDFLARED_SHA256_amd64="9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17"
+# shellcheck disable=SC2034  # read indirectly as ${!expected_var} below
+CLOUDFLARED_SHA256_arm64="65259e652a7bea08bf5df603233ab22b8bf3116af8df9f9206209af6a1b955c0"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 if [[ ! -x "$CLOUDFLARED_BIN" ]]; then
     case "$(uname -m)" in
         x86_64|amd64)   cf_arch="amd64" ;;
         aarch64|arm64)  cf_arch="arm64" ;;
         *)              die "Unsupported CPU arch $(uname -m) for cloudflared auto-download; install it manually and set CLOUDFLARED_BIN." ;;
     esac
-    cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
-    log "Downloading cloudflared ($cf_arch) to $CLOUDFLARED_BIN ..."
-    curl -fL --retry 3 -o "$CLOUDFLARED_BIN" "$cf_url" \
+    cf_url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${cf_arch}"
+    log "Downloading cloudflared $CLOUDFLARED_VERSION ($cf_arch) to $CLOUDFLARED_BIN ..."
+    curl -fL --retry 3 -o "$CLOUDFLARED_BIN.tmp" "$cf_url" \
         || die "Failed to download cloudflared from $cf_url (does the node have outbound internet?)."
+
+    expected_var="CLOUDFLARED_SHA256_${cf_arch}"
+    expected="${!expected_var:-}"
+    actual="$(sha256_of "$CLOUDFLARED_BIN.tmp")"
+    if [[ -z "$actual" ]]; then
+        warn "Neither sha256sum nor shasum is available — cannot verify the cloudflared download."
+    elif [[ -z "$expected" ]]; then
+        warn "No pinned checksum for $cf_arch. Downloaded sha256: $actual"
+    elif [[ "$actual" != "$expected" ]]; then
+        rm -f "$CLOUDFLARED_BIN.tmp"
+        die "cloudflared checksum mismatch for $cf_arch.
+  expected: $expected
+  got:      $actual
+Refusing to run it. If you deliberately changed CLOUDFLARED_VERSION, update the pinned hash in $0."
+    else
+        log "Checksum verified."
+    fi
+
+    mv "$CLOUDFLARED_BIN.tmp" "$CLOUDFLARED_BIN"
     chmod +x "$CLOUDFLARED_BIN"
 fi
 log "Using cloudflared: $CLOUDFLARED_BIN"

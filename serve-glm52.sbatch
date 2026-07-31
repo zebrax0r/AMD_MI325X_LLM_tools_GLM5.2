@@ -6,6 +6,10 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/glm52-%j.out
 #SBATCH --error=logs/glm52-%j.out
+#SBATCH --open-mode=append
+# Deliver SIGTERM to the batch shell 120s before walltime, so serve-glm52.sh's
+# trap can stop the container cleanly instead of it being killed mid-request.
+#SBATCH --signal=B:TERM@120
 #
 # Batch wrapper around serve-glm52.sh. Submit with:
 #
