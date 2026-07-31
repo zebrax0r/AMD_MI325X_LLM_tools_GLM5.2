@@ -1,0 +1,44 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning \
+            serve-glm52.sh \
+            share-glm52.sh \
+            opencode-setup.sh \
+            serve-glm52.sbatch
+
+      - name: validate opencode provider template
+        run: |
+          # Fill the placeholders the way opencode-setup.sh does, then check the
+          # result is valid JSON and carries the fields opencode needs.
+          sed -e 's/__HOST__/example/' -e 's/__PORT__/30000/' opencode.glm52.json \
+            | jq -e '.provider["glm52-local"].options.baseURL
+                     and .provider["glm52-local"].models["glm-5.2"]
+                     and .model and .small_model' > /dev/null
+
+      - name: check the jq merge preserves an existing config
+        run: |
+          # A config that already picks a model must keep it; a missing
+          # small_model must get filled in.
+          provider=$(sed -e 's/__HOST__/example/' -e 's/__PORT__/30000/' opencode.glm52.json)
+          echo '{"provider":{"other":{}},"model":"someone/else"}' \
+            | jq --argjson new "$provider" \
+                '.provider = ((.provider // {}) + $new.provider)
+                 | .model //= $new.model
+                 | .small_model //= $new.small_model' \
+            | jq -e '.model == "someone/else"
+                     and .small_model == "glm52-local/glm-5.2"
+                     and (.provider | has("other") and has("glm52-local"))' > /dev/null
