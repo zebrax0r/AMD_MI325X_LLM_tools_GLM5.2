@@ -31,11 +31,12 @@ export SGLANG_API_KEY="${SGLANG_API_KEY:-}"
 
 export MODEL_ID="${MODEL_ID:-zai-org/GLM-5.2-FP8}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm-5.2}"
-export SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616}"
+# rocm720 build: matches the host's ROCm 7.2.4 more closely than the rocm700 one.
+export SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang-rocm:v0.5.16-rocm720-mi30x-20260731}"
 
 # If you later get MI355X (gfx950) time, switch to the blog-post setup:
 #   export MODEL_ID="amd/GLM-5.2-MXFP4"
-#   export SGLANG_IMAGE="lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618"
+#   export SGLANG_IMAGE="lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260731"
 #   export TP_SIZE=4
 #   export EXTRA_SGLANG_ARGS="--dp 2 --enable-dp-attention"
 
@@ -50,12 +51,62 @@ export PORT="${PORT:-30000}"
 export TP_SIZE="${TP_SIZE:-auto}"
 
 export CONTEXT_LEN="${CONTEXT_LEN:-262144}"     # model supports up to 1M
-export MEM_FRACTION="${MEM_FRACTION:-0.85}"
 export SHM_SIZE="${SHM_SIZE:-64g}"
+
+# Leave MEM_FRACTION empty to let SGLang derive --mem-fraction-static from the
+# GPU's memory capacity. The old hard-coded 0.85 capped a 256 GB MI325X ~38 GB
+# per GPU below what its heuristic would allow — roughly 300 GB of KV cache
+# across the node. Only set a number here to work around an OOM.
+export MEM_FRACTION="${MEM_FRACTION:-}"
+
+# ── AMD / DSA fast path (leave these alone unless debugging) ────────────────
+#
+# GLM-5.2 is a DeepSeek-Sparse-Attention model (GlmMoeDsaForCausalLM). SGLang
+# only takes the fast DSA path on ROCm — aiter's preshuffle paged-MQA kernel
+# and a KV page size of 64 — when SGLANG_USE_AITER is truthy. It defaults to
+# OFF upstream, and without it SGLang silently drops to page_size=1, i.e. one
+# token per KV page. Look for "Setting page size to 64 for DeepSeek DSA" in the
+# startup log; serve-glm52.sh checks for you and warns if it says 1.
+export USE_AITER="${USE_AITER:-1}"
+
+# The preshuffle path also needs Triton >= 3.5 inside the image. If the log
+# still reports page size 1 with USE_AITER=1, set this to use aiter's
+# ahead-of-time gluon kernels instead.
+export AITER_AOT_GLUON="${AITER_AOT_GLUON:-0}"
 
 # aiter fused allreduce (from the wafer.ai blog; validated there on MI355X).
 # Set to 0 if you see NCCL/RCCL or allreduce-related crashes on MI325X.
 export ENABLE_AITER_ALLREDUCE_FUSION="${ENABLE_AITER_ALLREDUCE_FUSION:-1}"
+
+# ── Observability ───────────────────────────────────────────────────────────
+
+# Prometheus /metrics plus per-request prefix-cache hit rates. The cache report
+# is the only way to see whether prefix caching is actually helping the agent.
+export ENABLE_METRICS="${ENABLE_METRICS:-1}"
+
+# ── Optional performance features (benchmark before trusting) ───────────────
+#
+# Measure with:  ./serve-glm52.sh bench
+# Change one at a time and compare against the baseline.
+
+# MTP speculative decoding. The FP8 checkpoint ships the NextN draft layer
+# (model.layers.78.eh_proj / .enorm / .hnorm), so no separate draft model is
+# needed. Off by default: the DSA + MTP combination is not yet proven on
+# gfx942. If it works, it is the largest single-stream latency win available.
+export ENABLE_MTP="${ENABLE_MTP:-0}"
+export MTP_NUM_STEPS="${MTP_NUM_STEPS:-3}"
+export MTP_NUM_DRAFT_TOKENS="${MTP_NUM_DRAFT_TOKENS:-4}"
+
+# HiCache: tier the radix prefix cache into host RAM. Well matched to opencode,
+# which re-sends a near-identical prefix every turn. Requires the page-size-64
+# DSA path, so keep USE_AITER=1 alongside it. HICACHE_RATIO is host memory as a
+# multiple of GPU KV memory.
+export ENABLE_HICACHE="${ENABLE_HICACHE:-0}"
+export HICACHE_RATIO="${HICACHE_RATIO:-2}"
+
+# Set to "lpm" (longest prefix match) when several people share the endpoint:
+# it reorders requests to encourage cache hits, at some scheduling cost.
+export SCHEDULE_POLICY="${SCHEDULE_POLICY:-}"
 
 # Seconds to wait for the server to come up (first run downloads ~750 GB of
 # weights unless you prefetched with './serve-glm52.sh download').

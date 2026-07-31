@@ -20,20 +20,30 @@ it top to bottom.
 | | |
 |---|---|
 | Model | `zai-org/GLM-5.2-FP8` (753B MoE), served under the name `glm-5.2` |
-| Engine | SGLang, pinned ROCm image `lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616` |
+| Architecture | `GlmMoeDsaForCausalLM` — MLA attention + DeepSeek Sparse Attention (`index_topk` 2048) |
+| Engine | SGLang, pinned ROCm image `lmsysorg/sglang-rocm:v0.5.16-rocm720-mi30x-20260731` |
 | Parallelism | TP8 across the node's 8 GPUs |
 | Context | 262,144 tokens by default (`CONTEXT_LEN`; model supports up to 1M) |
-| KV cache | FP8 (`fp8_e4m3`) |
+| KV cache | FP8 (`fp8_e4m3`), MLA-compressed, tiered to host RAM if `ENABLE_HICACHE=1` |
 | Tool calling / thinking | `--tool-call-parser glm47 --reasoning-parser glm45` — required for opencode's agentic loop |
+| Observability | Prometheus `/metrics` + prefix-cache hit rates (`ENABLE_METRICS`, on by default) |
 | Auth | Bearer API key, auto-generated and persisted to `$MODEL_CACHE_DIR/glm52-api-key` |
 
 **Why FP8 and not the blog's MXFP4?** The wafer.ai post ran the MXFP4 quant on
 MI355X. That quant (`amd/GLM-5.2-MXFP4`) requires gfx950 silicon, so on MI325X
-(gfx942) this repo serves the FP8 variant at TP8 instead — ~750 GB of weights
-across 2 TB of HBM, leaving over 1 TB for KV cache. The container ships its own
-ROCm 7.0 userspace, which runs fine on the host's ROCm 7.2.4 (only the kernel
-driver is shared). If you get MI355X time, one config change flips to the blog's
-exact setup — see [Running on MI355X instead](#running-on-mi355x-instead).
+(gfx942) this repo serves the FP8 variant at TP8 instead — ~755 GB of weights
+across 2 TB of HBM. The container ships its own ROCm 7.2 userspace, which runs
+on the host's ROCm 7.2.4 (only the kernel driver is shared). If you get MI355X
+time, one config change flips to the blog's exact setup — see
+[Running on MI355X instead](#running-on-mi355x-instead).
+
+**A note on the KV cache.** GLM-5.2 uses MLA, so the KV cache is compressed to a
+512-dim latent plus a 64-dim rope key per token per layer — perhaps two orders of
+magnitude smaller than a comparably-sized MHA model. Combined with sparse
+attention (each query attends to at most 2048 keys), this is why 262 k context is
+affordable here and why the leftover HBM after weights goes a very long way. It
+also means KV capacity is rarely the binding constraint; see
+[Performance tuning](#performance-tuning) for what actually is.
 
 ## Hardware & how many GPUs you need
 
@@ -96,12 +106,13 @@ Before you start, confirm you have:
 
 | File | Purpose |
 |---|---|
-| `serve-glm52.sh` | The core one-click script: preflight, download, serve, stop, status |
+| `serve-glm52.sh` | The core one-click script: preflight, download, serve, bench, stop, status |
 | `serve-glm52.sbatch` | SLURM batch wrapper around `serve-glm52.sh serve` |
 | `glm52-env.example` | Config template — copy to `glm52.env` and edit |
 | `opencode-setup.sh` | Writes/merges the opencode provider config on any machine |
 | `opencode.glm52.json` | The provider template `opencode-setup.sh` fills in |
 | `share-glm52.sh` | Optional: public HTTPS tunnel via Cloudflare for users without SSH |
+| `.github/workflows/lint.yml` | CI: shellcheck + opencode config-template checks |
 | `README.md` | This file |
 
 Secrets never live in the repo: `glm52.env` (your HF token) and the generated
@@ -218,6 +229,12 @@ prints the block to paste). The config references `{env:SGLANG_API_KEY}`, so
 export that variable in the shell that launches opencode. Then restart opencode
 and pick **GLM 5.2 (MI325X/SGLang)** via `/models`.
 
+It also points opencode's `model` and `small_model` at `glm-5.2` — but only if
+you haven't already set them, so an existing config is never overridden. The
+`small_model` part matters on a compute node: opencode uses it for titles and
+summarisation, and left unset it reaches for a cloud provider the node usually
+cannot see.
+
 **A) On the GPU node itself** (simplest — pairs with `serve --detach`):
 
 ```bash
@@ -292,6 +309,7 @@ cluster account on their end. Manage with `./share-glm52.sh status` / `stop`.
 ./serve-glm52.sh [serve]         start serving (default), stays attached
 ./serve-glm52.sh serve --detach  start serving, wait until healthy, return the shell
 ./serve-glm52.sh download        prefetch image + weights only (no GPU)
+./serve-glm52.sh bench           benchmark the running server (sglang.bench_serving)
 ./serve-glm52.sh stop            stop the server container
 ./serve-glm52.sh status          container state + health check
 
@@ -326,15 +344,84 @@ All knobs live in `glm52.env` (copied from `glm52-env.example`). Anything you
 | `SGLANG_API_KEY` | *(auto-generated)* | Endpoint bearer key; if unset, generated and saved to `$MODEL_CACHE_DIR/glm52-api-key` |
 | `MODEL_ID` | `zai-org/GLM-5.2-FP8` | Model repo to serve |
 | `SERVED_MODEL_NAME` | `glm-5.2` | Name clients use in the `model` field |
-| `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616` | Container image |
+| `SGLANG_IMAGE` | `lmsysorg/sglang-rocm:v0.5.16-rocm720-mi30x-20260731` | Container image |
 | `PORT` | `30000` | Endpoint port on the node |
 | `TP_SIZE` | `auto` | Tensor-parallel degree (= GPUs used). `auto` = the GPU count SLURM allocated; or set `4`/`8` explicitly |
 | `CONTEXT_LEN` | `262144` | Max context length |
-| `MEM_FRACTION` | `0.85` | SGLang `--mem-fraction-static` |
+| `MEM_FRACTION` | *(empty)* | `--mem-fraction-static`. Empty = let SGLang size it from GPU capacity. Set a number only to work around OOM |
 | `SHM_SIZE` | `64g` | Container `/dev/shm` size |
+| `USE_AITER` | `1` | `SGLANG_USE_AITER`. Required for the fast DSA path — see [Performance tuning](#performance-tuning) |
+| `AITER_AOT_GLUON` | `0` | `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS`. Set `1` if the log still reports DSA page size 1 |
 | `ENABLE_AITER_ALLREDUCE_FUSION` | `1` | Toggle `--enable-aiter-allreduce-fusion` (set `0` if allreduce crashes) |
+| `ENABLE_METRICS` | `1` | `--enable-metrics --enable-cache-report` |
+| `ENABLE_MTP` | `0` | MTP speculative decoding (opt-in, benchmark it) |
+| `MTP_NUM_STEPS` / `MTP_NUM_DRAFT_TOKENS` | `3` / `4` | MTP depth |
+| `ENABLE_HICACHE` | `0` | Host-RAM KV cache tier (opt-in, benchmark it) |
+| `HICACHE_RATIO` | `2` | Host memory as a multiple of GPU KV memory |
+| `SCHEDULE_POLICY` | — | Set `lpm` to reorder for prefix-cache hits on a shared endpoint |
 | `READY_TIMEOUT` | `7200` | Seconds to wait for health before giving up |
 | `EXTRA_SGLANG_ARGS` | — | Extra flags appended verbatim to `sglang.launch_server` |
+
+Benchmark knobs for `./serve-glm52.sh bench`: `BENCH_PROMPTS` (200),
+`BENCH_INPUT_LEN` (8192), `BENCH_OUTPUT_LEN` (512), `BENCH_CONCURRENCY` (16).
+
+---
+
+## Performance tuning
+
+### The one that matters: `USE_AITER=1`
+
+GLM-5.2 is a DeepSeek-Sparse-Attention model. On ROCm, SGLang picks the DSA KV
+page size like this ([`arg_groups/overrides.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/arg_groups/overrides.py)):
+
+```python
+if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
+    overrides["page_size"] = 1     # legacy ROCm DSA path
+else:
+    overrides["page_size"] = 64
+```
+
+`aiter_can_use_preshuffle_paged_mqa()` returns `False` unless `SGLANG_USE_AITER`
+is set, and upstream it **defaults to off**. Unset, you get one token per KV
+page, no zero-copy preshuffle gather, and HiCache's page-first layouts become
+unusable. `USE_AITER=1` is the default here for that reason; `serve-glm52.sh`
+greps the startup log after launch and warns if SGLang still chose page size 1.
+If it does, set `AITER_AOT_GLUON=1` (the preshuffle path also wants Triton ≥
+3.5 in the image).
+
+Note that `--enable-aiter-allreduce-fusion` is a *different* switch — it tunes
+collectives, not attention, and does not enable this path.
+
+### Let SGLang size the KV pool
+
+SGLang computes `mem_fraction_static` from GPU capacity, chunked-prefill size
+and decode CUDA-graph batch size — but **only when the flag is absent**. Pinning
+it (this repo used to pin 0.85) caps a 256 GB MI325X roughly 38 GB per GPU below
+what the heuristic allows, ~300 GB across the node. Leave `MEM_FRACTION` empty
+unless you are chasing an OOM.
+
+### Optional, measure before trusting
+
+Both are off by default. Turn on one at a time and compare with
+`./serve-glm52.sh bench`.
+
+- **`ENABLE_MTP=1`** — MTP speculative decoding. The FP8 checkpoint ships the
+  NextN draft layer (`model.layers.78.eh_proj` / `.enorm` / `.hnorm`), so no
+  separate draft model is needed. Off by default only because the DSA + MTP
+  combination is not yet proven on gfx942 — if it works on your node it is the
+  biggest single-stream latency win available. (NGRAM speculation is CUDA-only;
+  don't bother.)
+- **`ENABLE_HICACHE=1`** — tiers the radix prefix cache into host RAM using the
+  AMD-friendly `page_first_direct` layout. Well suited to opencode, which
+  re-sends a near-identical prefix every turn. Needs the page-size-64 path
+  above, so keep `USE_AITER=1` with it.
+
+### Knowing whether it worked
+
+`ENABLE_METRICS=1` (default) exposes Prometheus at `http://<node>:$PORT/metrics`
+and adds prefix-cache hit rates to responses. The cache hit rate is the number to
+watch for an agent workload — if it is low, opencode is paying full prefill on
+every turn and HiCache / `SCHEDULE_POLICY=lpm` are the levers.
 
 ---
 
@@ -345,10 +432,12 @@ in `glm52.env`:
 
 ```bash
 export MODEL_ID="amd/GLM-5.2-MXFP4"
-export SGLANG_IMAGE="lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618"
+export SGLANG_IMAGE="lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260731"
 export TP_SIZE=4
 export EXTRA_SGLANG_ARGS="--dp 2 --enable-dp-attention"
 ```
+
+MXFP4 also requires `SGLANG_USE_AITER=1`, which `USE_AITER=1` already sets.
 
 `serve-glm52.sh` also detects gfx950 at runtime and reminds you of this.
 
@@ -357,8 +446,16 @@ export EXTRA_SGLANG_ARGS="--dp 2 --enable-dp-attention"
 ## Notes & troubleshooting
 
 - **Startup time**: with cached weights, ~10–20 minutes to healthy. Watch
-  details with `podman logs -f glm52-sglang`. The script health-polls and prints
-  the banner only when `/health` returns 200.
+  details with `podman logs -f glm52-sglang`. The script polls `/health` (HTTP
+  server listening), then does one `/health_generate` call, which runs a real
+  forward pass and so also covers weight load, graph capture and the DSA
+  kernels. The banner prints after both.
+- **The API key is visible in the process table.** SGLang only accepts
+  `--api-key` as a command-line argument — there is no env-var or file
+  equivalent — so it lands in `/proc/<pid>/cmdline`, which is world-readable on
+  most clusters unless the site sets `hidepid`. On an `--exclusive` allocation
+  this is moot; on a shared node, assume anyone else on that node can read your
+  key. Rotate by deleting `$MODEL_CACHE_DIR/glm52-api-key` and restarting.
 - **"cannot set shmsize when running in the host IPC Namespace"**: already
   handled — the script uses a private IPC namespace with `--shm-size=64g` (podman
   forbids `--shm-size` together with `--ipc=host`; Docker tolerates it).
@@ -369,9 +466,11 @@ export EXTRA_SGLANG_ARGS="--dp 2 --enable-dp-attention"
   keep-groups --security-opt seccomp=unconfined --network=host --device=/dev/kfd
   --device=/dev/dri`. If your site uses a shared image store you may need to
   `podman pull` the ~20 GB image once per node image cache.
-- **No speculative decoding**: MTP/EAGLE draft kernels aren't validated on ROCm
-  for this model yet, so no `--speculative-*` flags are passed. Revisit as SGLang
-  ROCm images advance.
+- **Speculative decoding**: off by default but *available* — the FP8 checkpoint
+  ships the MTP/NextN draft layer, so `ENABLE_MTP=1` needs no extra weights. It
+  is opt-in because the DSA + MTP path is unproven on gfx942, not because the
+  weights are missing. Benchmark it; see
+  [Performance tuning](#performance-tuning).
 - **`--enable-aiter-allreduce-fusion`** comes from the wafer.ai post (validated
   there on MI355X). If you hit allreduce/RCCL crashes on MI325X, set
   `ENABLE_AITER_ALLREDUCE_FUSION=0`.
