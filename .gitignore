@@ -1,4 +1,3 @@
 glm52.env
 logs/
 *.bak
-cloudflared/

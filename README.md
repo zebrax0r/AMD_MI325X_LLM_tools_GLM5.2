@@ -3,15 +3,14 @@
 Serve [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) from a single 8×
 AMD MI325X node on a SLURM cluster, in a **podman** container, via **SGLang**,
 exposing an OpenAI-compatible endpoint you can drive with
-[opencode](https://opencode.ai) — from the node itself, the login node, your
-laptop over SSH, or (optionally) anyone over a public HTTPS tunnel.
+[opencode](https://opencode.ai) — from the node itself, the login node, or your
+laptop over SSH.
 
 Modeled on [wafer.ai's GLM-5.2-on-AMD writeup](https://www.wafer.ai/blog/glm52-amd).
 Tested on 8× MI325X (gfx942), ROCm 7.2.4, Ubuntu, rootless podman.
 
-This README is a complete walkthrough — if you have SSH access to the cluster
-and an account, you can go from clone to a working coding endpoint by following
-it top to bottom.
+This README is a complete walkthrough — with an account on the cluster you can
+go from clone to a working coding endpoint by following it top to bottom.
 
 ---
 
@@ -111,7 +110,6 @@ Before you start, confirm you have:
 | `glm52-env.example` | Config template — copy to `glm52.env` and edit |
 | `opencode-setup.sh` | Writes/merges the opencode provider config on any machine |
 | `opencode.glm52.json` | The provider template `opencode-setup.sh` fills in |
-| `share-glm52.sh` | Optional: public HTTPS tunnel via Cloudflare for users without SSH |
 | `.github/workflows/lint.yml` | CI: shellcheck + opencode config-template checks |
 | `README.md` | This file |
 
@@ -120,7 +118,7 @@ API key are gitignored / stored under `$MODEL_CACHE_DIR`.
 
 ---
 
-## Walkthrough (primary path — you have SSH access)
+## Walkthrough
 
 ### Step 0 — Get the code onto the cluster
 
@@ -276,33 +274,6 @@ scancel <jobid>              # for a batch job
 
 ---
 
-## Sharing with someone who has no SSH access (optional)
-
-`share-glm52.sh` exposes the running endpoint over public HTTPS via a
-**Cloudflare quick tunnel** — outbound-only (works on locked-down nodes), no
-root, no Cloudflare account. Run it on the GPU node after the server is up:
-
-```bash
-./share-glm52.sh share --detach     # prints https://<random>.trycloudflare.com
-```
-
-On first use it downloads `cloudflared` into `$MODEL_CACHE_DIR/cloudflared/`,
-checks the local server is healthy, opens the tunnel, and prints a ready-to-paste
-opencode provider block (with the public URL and API key) to hand over. The
-recipient drops it into their `~/.config/opencode/opencode.json`, restarts
-opencode, and picks **GLM 5.2 (shared)** via `/models` — no SSH, no tunnel, no
-cluster account on their end. Manage with `./share-glm52.sh status` / `stop`.
-
-> ⚠️ **The public URL + API key together grant full use of your model and your
-> cluster's GPU-hours.** Share the key over a private channel only, rotate it if
-> it leaks (delete `$MODEL_CACHE_DIR/glm52-api-key` and restart the server), and
-> **check your site's acceptable-use policy before exposing HPC compute
-> externally** — the API key is the only gate. Quick-tunnel URLs are random and
-> change on every restart; for a stable address, use Tailscale or a named
-> Cloudflare tunnel with your own domain.
-
----
-
 ## Script reference
 
 ```
@@ -316,10 +287,6 @@ cluster account on their end. Manage with `./share-glm52.sh status` / `stop`.
 ./opencode-setup.sh [--host H] [--port P] [--api-key K] [--embed-key] [--config PATH]
                                  write/merge the opencode provider config
                                  (--embed-key writes the key literally instead of {env:...})
-
-./share-glm52.sh [share]         open a public HTTPS Cloudflare tunnel (add --detach to background)
-./share-glm52.sh stop            take the tunnel offline
-./share-glm52.sh status          tunnel state + current public URL
 ```
 
 Handy extras:
